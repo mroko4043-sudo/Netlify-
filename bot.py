@@ -24,6 +24,9 @@ ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 DEFAULT_CREDIT = 1
 NETLIFY_API = "https://api.netlify.com/api/v1"
 PORT = int(os.getenv("PORT", "10000"))
+# Optional custom domain. Example: https://example.com
+# If set, the bot shows this URL instead of the Netlify subdomain.
+PUBLIC_SITE_URL = os.getenv("PUBLIC_SITE_URL", "").strip().rstrip("/")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,6 +51,9 @@ def validate_config():
 
 ADMIN_ID = validate_config()
 DB_PATH = "bot_data.db"
+
+# Per-user rename state: user_id -> selected site_id
+pending_rename = {}
 
 def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -229,6 +235,27 @@ def delete_netlify_site(site_id):
         logger.exception("Netlify cleanup failed")
         return False
 
+def rename_netlify_site(site_id, new_name):
+    """Rename the Netlify site and return the updated site object."""
+    clean = re.sub(r"[^a-z0-9-]", "-", new_name.lower().strip())
+    clean = re.sub(r"-+", "-", clean).strip("-")[:50]
+    if not clean:
+        return None
+    try:
+        response = requests.patch(
+            f"{NETLIFY_API}/sites/{site_id}",
+            headers=netlify_json_headers(),
+            json={"name": clean},
+            timeout=30,
+        )
+    except requests.RequestException:
+        logger.exception("Netlify site rename failed")
+        return None
+    if response.status_code == 200:
+        return response.json()
+    logger.error("Rename site failed: %s %s", response.status_code, response.text)
+    return None
+
 def validate_zip(zip_bytes):
     if len(zip_bytes) > 20 * 1024 * 1024:
         return False, "ZIP file is larger than 20 MB."
@@ -257,8 +284,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     create_user(user.id, user.username)
     keyboard = [
-        [InlineKeyboardButton("📊 Credits", callback_data="credits"),
-         InlineKeyboardButton("🌐 My Sites", callback_data="mysites")],
+        [InlineKeyboardButton("🚀 Host Site", callback_data="host")],
+        [InlineKeyboardButton("✏️ Rename Site", callback_data="rename_menu")],
+        [InlineKeyboardButton("🌐 My Sites", callback_data="mysites"),
+         InlineKeyboardButton("📊 Credits", callback_data="credits")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
     ]
     await update.message.reply_text(
@@ -283,7 +312,7 @@ async def mysites(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["🌐 Your hosted sites:\n"]
     for site_id, site_name, url, created_at in sites[:20]:
-        lines.append(f"• {site_name or site_id}\n  {url}")
+        lines.append(f"• {site_name or site_id}\n  {url}\n  🆔 Site ID: {site_id}")
     await update.message.reply_text("\n".join(lines))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -322,23 +351,94 @@ async def addcredit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def rename_site(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command fallback: /rename <site_id> <new_name>.
+    The preferred flow is the Rename Site button.
+    """
+    user_id = update.effective_user.id
+    sites = {row[0]: row for row in get_user_sites(user_id)}
+
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /rename <site_id> <new_name>")
+        if not sites:
+            await update.message.reply_text("🌐 You have no hosted sites to rename.")
+            return
+        keyboard = [
+            [InlineKeyboardButton(
+                f"✏️ {name or sid}", callback_data=f"rename_select:{sid}"
+            )]
+            for sid, name, url, created in sites.values()
+        ]
+        await update.message.reply_text(
+            "✏️ Select the site you want to rename:",
+            reply_markup=InlineKeyboardMarkup(keyboard[:20]),
+        )
         return
+
     site_id = context.args[0]
     new_name = " ".join(context.args[1:]).strip()
+    site = sites.get(site_id)
+    if not site:
+        # Also accept a saved Netlify URL.
+        for sid, row in sites.items():
+            if row[2].rstrip("/") == site_id.rstrip("/"):
+                site_id, site = sid, row
+                break
+    if not site:
+        await update.message.reply_text("❌ Site not found. Use ✏️ Rename Site to select it.")
+        return
     if not valid_site_name(new_name):
         await update.message.reply_text(
             "Invalid name. Use 1–50 letters, numbers, spaces or hyphens."
         )
         return
-    sites = {row[0]: row for row in get_user_sites(update.effective_user.id)}
+
+    await update.message.reply_text("⏳ Renaming site on Netlify...")
+    renamed = await asyncio.to_thread(rename_netlify_site, site_id, new_name)
+    if not renamed:
+        await update.message.reply_text("❌ Could not rename the Netlify site. Please try again.")
+        return
+
+    final_name = renamed.get("name") or new_name
+    final_url = renamed.get("ssl_url") or renamed.get("url") or site[2]
+    update_site_name(site_id, final_name, final_url)
+    await update.message.reply_text(
+        f"✅ Rename complete!\n\n🏷️ Name: {final_name}\n🌐 {final_url}"
+    )
+
+async def rename_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives the new name after a user selects a site from the button."""
+    user_id = update.effective_user.id
+    site_id = pending_rename.get(user_id)
+    if not site_id:
+        return
+
+    new_name = (update.message.text or "").strip()
+    if not valid_site_name(new_name):
+        await update.message.reply_text(
+            "❌ Invalid name. Use 1–50 letters, numbers, spaces or hyphens.\n\n"
+            "Please send the new site name again."
+        )
+        return
+
+    sites = {row[0]: row for row in get_user_sites(user_id)}
     site = sites.get(site_id)
     if not site:
-        await update.message.reply_text("❌ Site not found.")
+        pending_rename.pop(user_id, None)
+        await update.message.reply_text("❌ Site not found. Please open Rename Site again.")
         return
-    update_site_name(site_id, new_name, site[2])
-    await update.message.reply_text(f"✅ Saved site name changed to: {new_name}")
+
+    status = await update.message.reply_text("⏳ Renaming site on Netlify...")
+    renamed = await asyncio.to_thread(rename_netlify_site, site_id, new_name)
+    if not renamed:
+        await status.edit_text("❌ Could not rename the Netlify site. Please try again.")
+        return
+
+    final_name = renamed.get("name") or new_name
+    final_url = renamed.get("ssl_url") or renamed.get("url") or site[2]
+    update_site_name(site_id, final_name, final_url)
+    pending_rename.pop(user_id, None)
+    await status.edit_text(
+        f"✅ Rename complete!\n\n🏷️ Name: {final_name}\n🌐 {final_url}"
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -348,22 +448,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "credits":
         text = f"💳 Your credits: {get_credits(user_id)}"
-    elif query.data == "mysites":
+        await query.edit_message_text(text)
+        return
+
+    if query.data == "host":
+        await query.edit_message_text("🚀 Send your ZIP file now. It must contain index.html at the root.")
+        return
+
+    if query.data == "rename_menu":
+        sites = get_user_sites(user_id)
+        if not sites:
+            await query.edit_message_text("❌ You have no hosted sites to rename.")
+            return
+        buttons = []
+        for sid, name, url, created in sites[:20]:
+            label = f"✏️ {name or sid}"[:60]
+            buttons.append([InlineKeyboardButton(label, callback_data=f"rename_select:{sid}")])
+        await query.edit_message_text("✏️ Select the site you want to rename:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if query.data.startswith("rename_select:"):
+        site_id = query.data.split(":", 1)[1]
+        site = {row[0]: row for row in get_user_sites(user_id)}.get(site_id)
+        if not site:
+            await query.edit_message_text("❌ Site not found.")
+            return
+        context.user_data["rename_site_id"] = site_id
+        await query.edit_message_text(
+            f"✏️ Current name: {site[1] or site_id}\n\nSend the new site name:"
+        )
+        return
+
+    if query.data == "mysites":
         sites = get_user_sites(user_id)
         if not sites:
             text = "🌐 You have no hosted sites yet."
         else:
             text = "🌐 Your hosted sites:\n\n" + "\n".join(
-                f"• {name or sid}\n  {url}" for sid, name, url, created in sites[:20]
+                f"• {name or sid}\n  🆔 {sid}\n  {url}" for sid, name, url, created in sites[:20]
             )
-    else:
-        text = (
-            "📖 Send a ZIP containing index.html at the ZIP root.\n\n"
-            "/credits — Check credits\n"
-            "/mysites — View hosted sites\n"
-            "/rename <site_id> <new_name> — Rename\n"
-            "/addcredit <uid> <amount> — Admin only"
-        )
+        await query.edit_message_text(text)
+        return
+
+    text = (
+        "📖 Send a ZIP containing index.html at the ZIP root.\n\n"
+        "/credits — Check credits\n"
+        "/mysites — View hosted sites\n"
+        "/rename <site_id> <new_name> — Rename\n"
+        "/addcredit <uid> <amount> — Admin only"
+    )
     await query.edit_message_text(text)
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,7 +562,14 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        url = deploy.get("ssl_url") or deploy.get("url") or ""
+        # Always use the deployed site URL, never a Netlify dashboard/admin URL.
+        netlify_url = deploy.get("ssl_url") or deploy.get("url") or ""
+        url = PUBLIC_SITE_URL or netlify_url
+        if not url:
+            update_credits(user.id, 1)
+            await asyncio.to_thread(delete_netlify_site, site_id)
+            await status.edit_text("❌ Deployment succeeded but no public website URL was returned. Credit refunded.")
+            return
         save_site(user.id, site_id, site_name, url)
         await status.edit_text(
             "✅ Website deployed successfully!\n\n"
@@ -475,6 +615,7 @@ async def main():
     application.add_handler(CommandHandler("addcredit", addcredit))
     application.add_handler(CommandHandler("rename", rename_site))
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, rename_name_handler))
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_error_handler(error_handler)
 
