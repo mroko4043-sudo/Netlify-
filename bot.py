@@ -571,11 +571,27 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("❌ Deployment succeeded but no public website URL was returned. Credit refunded.")
             return
         save_site(user.id, site_id, site_name, url)
+        manual_settings = (
+            "⚙️ Netlify settings to check manually\n\n"
+            "1️⃣ Project visibility\n"
+            "   • Customize this project's visibility\n"
+            "   • Select Public\n"
+            "   • Select Production and previews\n"
+            "   • Tap Save\n\n
+            "2️⃣ Powered by Netlify badge\n"
+            "   • Open Project configuration → General → Powered by Netlify badge\n"
+            "   • Turn ON “Show the badge on this project”\n"
+            "   • Tap Save\n\n"
+            "ℹ️ These settings are not changed by this bot. If your Netlify team "
+            "defaults already match them, no manual change is needed."
+        )
+
         await status.edit_text(
             "✅ Website deployed successfully!\n\n"
             f"🌐 {url}\n"
             f"🆔 Site ID: `{site_id}`\n"
-            f"💳 Remaining credits: {get_credits(user.id)}",
+            f"💳 Remaining credits: {get_credits(user.id)}\n\n"
+            f"{manual_settings}",
             parse_mode="Markdown",
         )
     except Exception:
