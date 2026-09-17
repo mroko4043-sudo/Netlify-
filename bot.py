@@ -1,6 +1,6 @@
 import os
 import io
-import re
+import 
 import sqlite3
 import asyncio
 import logging
@@ -577,10 +577,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   • Customize this project's visibility\n"
             "   • Select Public\n"
             "   • Select Production and previews\n"
-            "   • Tap Save\n\n
+            "   • Tap Save\n\n"
             "2️⃣ Powered by Netlify badge\n"
             "   • Open Project configuration → General → Powered by Netlify badge\n"
-            "   • Turn ON “Show the badge on this project”\n"
+            "   • Keep “Show the badge on this project” OFF / unchecked\n"
             "   • Tap Save\n\n"
             "ℹ️ These settings are not changed by this bot. If your Netlify team "
             "defaults already match them, no manual change is needed."
@@ -653,4 +653,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
-        
